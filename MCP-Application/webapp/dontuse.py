@@ -13,10 +13,6 @@ from azure.identity import AzureCliCredential
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 import pandas as pd
-import difflib
-import re
-import io
-from prompt_manager import PromptManager
 
 # Add parent directory to path to import from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -587,11 +583,75 @@ class MCPToolManager:
             }
             
             # Create the prompt for GPT-4o to analyze the user message
-            tools_info_str = json.dumps(tools_info, indent=2)
-            connection_state_str = json.dumps(connection_state, indent=2)
-            
             messages = [
-                {"role": "system", "content": PromptManager.get_tool_detection_prompt(tools_info_str, connection_state_str)},
+                {"role": "system", "content": f"""You are an assistant that helps identify Power BI and Fabric operations in user messages.
+Your task is to analyze the user's message and determine which tool(s) should be executed and with what parameters.
+Do not engage in conversation. Just return a structured JSON response with your analysis.
+
+Available tools: {json.dumps(tools_info, indent=2)}
+
+Current connection state: {json.dumps(connection_state, indent=2)}
+
+SMART TOOL MAPPING:
+When users mention these concepts, map them to specific tools:
+1. SQL Endpoint, SQL connection, SQL database, connect to SQL, initialize SQL:
+   - Map to "sqlendpoint_initialize_sql_connection" tool
+   - Extract server/endpoint and database names from the message
+
+2. Power BI dataset, semantic model, PBI model, dataset connection, connect to Power BI:
+   - Map to "tabulareditor_connect_dataset" tool
+   - Extract workspace and dataset names from the message
+
+3. Show tables, list tables, get tables:
+   - If in SQL context: map to "sqlendpoint_get_sql_tables"
+   - If in Power BI context: map to "tabulareditor_list_tables"
+
+4. Run query, execute query, execute DAX:
+   - If DAX mentioned: map to "tabulareditor_execute_dax_query"
+   - If SQL mentioned: map to "sqlendpoint_execute_sql_query"
+
+EXAMPLES OF MAPPING:
+1. "Connect to SQL endpoint example.sql.azuresynapse.net with database myDB" 
+   → sqlendpoint_initialize_sql_connection with parameters {{"sql_endpoint": "example.sql.azuresynapse.net", "sql_database": "myDB"}}
+
+2. "Connect to Power BI dataset Sales Analysis in workspace Marketing" 
+   → tabulareditor_connect_dataset with parameters {{"workspace_identifier": "Marketing", "database_name": "Sales Analysis"}}
+
+3. "Show me all tables in the current SQL connection" 
+   → sqlendpoint_get_sql_tables
+
+4. "Run this DAX query: EVALUATE VALUES(DimProduct)" 
+   → tabulareditor_execute_dax_query with parameters {{"dax_query": "EVALUATE VALUES(DimProduct)"}}
+
+5. "Can you initialize the SQL endpoint at myserver.database.windows.net with the AdventureWorks database?"
+   → sqlendpoint_initialize_sql_connection with parameters {{"sql_endpoint": "myserver.database.windows.net", "sql_database": "AdventureWorks"}}
+
+Be aggressive in parameter extraction - look for names, IDs, and contextual clues even if they're not explicitly labeled.
+Infer parameter values from context when possible. For example:
+- A GUID-like string is likely a workspace_identifier
+- Words that sound like database or dataset names should be used for database_name
+- SQL endpoint URLs often contain "sql.azuresynapse.net" or similar patterns
+
+Return your response in the following JSON format:
+{{
+  "tools_to_execute": [
+    {{
+      "tool_name": "name_of_tool_to_execute",
+      "params": {{
+        "param1": "value1",
+        "param2": "value2"
+      }},
+      "confidence": 0.9,
+      "explanation": "Why this tool should be executed"
+    }}
+  ]
+}}
+
+If no tools should be executed, return an empty list for tools_to_execute.
+Do not include any tool that doesn't have all required parameters.
+Focus on extracting explicit information from the message, like GUIDs, table names, etc.
+For any GUID in the message, consider if it might be a workspace_identifier or database_name.
+"""},
                 {"role": "user", "content": user_message}
             ]
             
@@ -643,278 +703,6 @@ class MCPToolManager:
             logger.error(f"Error in GPT-based tool detection: {e}")
             return []
 
-    def execute_autonomous_workflow(self, user_message: str) -> Dict[str, Any]:
-        """
-        Execute complete autonomous workflow without requiring user 'continue' prompts.
-        Plans and executes all necessary tools in sequence to fully answer the user's question.
-        """
-        workflow_results = []
-        total_iterations = 0
-        max_iterations = 15  # Prevent infinite loops
-        
-        try:
-            logger.info(f"Starting autonomous workflow for: {user_message}")
-            
-            # Phase 1: Plan the complete workflow
-            workflow_plan = self._plan_complete_workflow(user_message)
-            logger.info(f"Workflow plan: {workflow_plan}")
-            
-            # Phase 2: Execute the planned workflow autonomously
-            current_message = user_message
-            accumulated_context = []
-            
-            while total_iterations < max_iterations:
-                total_iterations += 1
-                logger.info(f"Autonomous iteration {total_iterations}/{max_iterations}")
-                
-                # Detect and execute tools for current step
-                step_results = self.auto_detect_and_execute_tools(current_message)
-                
-                if not step_results:
-                    # No more tools needed - workflow complete
-                    logger.info("No more tools detected - workflow complete")
-                    break
-                
-                # Process step results
-                for result in step_results:
-                    if result["result"].get("success", False):
-                        # Store successful result
-                        workflow_results.append({
-                            "iteration": total_iterations,
-                            "tool_name": result["tool_name"], 
-                            "params": result["params"],
-                            "result": result["result"]["result"],
-                            "explanation": result["explanation"]
-                        })
-                        
-                        # Add result to accumulated context
-                        accumulated_context.append(f"Step {total_iterations}: {result['tool_name']} executed successfully")
-                        
-                        # Update current message with context for next iteration
-                        if result["result"]["result"]:
-                            # Format result for context
-                            formatted_result = self._format_result_for_context(result["result"]["result"])
-                            accumulated_context.append(f"Result: {formatted_result}")
-                    else:
-                        # Handle error with autonomous debugging
-                        logger.info(f"Tool execution failed, attempting autonomous fix...")
-                        error_result = self._handle_autonomous_error(
-                            result["tool_name"], 
-                            result["params"], 
-                            result["result"]["error"],
-                            accumulated_context
-                        )
-                        
-                        if error_result:
-                            workflow_results.append(error_result)
-                            accumulated_context.append(f"Step {total_iterations}: Error fixed and executed successfully")
-                
-                # Check if we have enough information to provide final answer
-                if self._workflow_complete_check(user_message, workflow_results):
-                    logger.info("Workflow determined complete based on results analysis")
-                    break
-                
-                # Prepare context for next iteration
-                context_summary = " ".join(accumulated_context[-3:])  # Keep last 3 context items
-                current_message = f"Based on previous results: {context_summary}. Continue with the original request: {user_message}"
-            
-            # Phase 3: Synthesize final comprehensive answer
-            final_answer = self._synthesize_final_answer(user_message, workflow_results)
-            
-            return {
-                "success": True,
-                "final_answer": final_answer,
-                "workflow_results": workflow_results,
-                "iterations_used": total_iterations,
-                "autonomous_execution": True
-            }
-            
-        except Exception as e:
-            logger.error(f"Error in autonomous workflow: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "partial_results": workflow_results,
-                "iterations_used": total_iterations
-            }
-
-    def _plan_complete_workflow(self, user_message: str) -> Dict[str, Any]:
-        """Plan the complete workflow needed to answer the user's question."""
-        try:
-            planning_prompt = f"""
-            Analyze this user request and plan the complete sequence of tools needed:
-            
-            User Request: {user_message}
-            
-            Available Tool Categories:
-            - Connection: fabric_get_workspace_info, fabric_get_lakehouse_info, tabulareditor_connect_dataset
-            - Discovery: tabulareditor_list_tables, sqlendpoint_get_sql_tables, sqlendpoint_get_sql_table_schema  
-            - Execution: sqlendpoint_execute_sql_query, tabulareditor_execute_dax_query
-            - Analysis: Various analysis and evaluation tools
-            
-            Current State: 
-            - Workspace: {self.connected_workspace}
-            - Dataset: {self.connected_dataset}
-            
-            Plan the complete workflow as a JSON object with:
-            - estimated_steps: number of tool executions needed
-            - workflow_type: "data_analysis", "connection_setup", "schema_exploration", etc.
-            - key_dependencies: what must happen before what
-            - expected_final_output: what the user should receive at the end
-            """
-            
-            messages = [{"role": "user", "content": planning_prompt}]
-            
-            response = client.chat.completions.create(
-                model=azure_deployment,
-                messages=messages,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                max_tokens=300
-            )
-            
-            return json.loads(response.choices[0].message.content)
-            
-        except Exception as e:
-            logger.warning(f"Workflow planning failed: {e}")
-            return {"estimated_steps": 5, "workflow_type": "general", "key_dependencies": [], "expected_final_output": "Data analysis results"}
-
-    def _format_result_for_context(self, result) -> str:
-        """Format tool result for use in next iteration context."""
-        if isinstance(result, (dict, list)):
-            # Summarize complex results
-            if isinstance(result, list) and len(result) > 3:
-                return f"Retrieved {len(result)} items (showing first 3): {str(result[:3])[:200]}..."
-            elif isinstance(result, dict) and len(str(result)) > 200:
-                return f"Retrieved data structure with keys: {list(result.keys())[:5]}"
-            else:
-                return str(result)[:200]
-        else:
-            return str(result)[:200]
-
-    def _workflow_complete_check(self, original_message: str, results: List[Dict]) -> bool:
-        """Check if we have enough information to provide a complete answer."""
-        # Simple heuristics for now
-        if len(results) >= 3:  # If we have at least 3 successful tool executions
-            # Check if we have data retrieval results
-            has_data = any("execute" in result.get("tool_name", "") for result in results)
-            has_schema = any("schema" in result.get("tool_name", "") or "table" in result.get("tool_name", "") for result in results)
-            
-            if has_data or (has_schema and len(results) >= 2):
-                return True
-        
-        return False
-
-    def _handle_autonomous_error(self, tool_name: str, params: Dict, error: str, context: List[str]) -> Optional[Dict]:
-        """Handle tool execution errors autonomously with debugging."""
-        try:
-            logger.info(f"Autonomous error handling for {tool_name}: {error}")
-            
-            # Use the existing debugging prompt from PromptManager
-            debug_prompt = PromptManager.get_debugging_prompt(
-                error=error,
-                tool=tool_name, 
-                params=json.dumps(params, indent=2),
-                history=json.dumps(context),
-                diagnostic=json.dumps({"autonomous_mode": True})
-            )
-            
-            messages = [{"role": "user", "content": debug_prompt}]
-            
-            response = client.chat.completions.create(
-                model=azure_deployment,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=800
-            )
-            
-            debug_response = response.choices[0].message.content
-            
-            # Extract corrected tool execution if present
-            if "TOOL_EXECUTION:" in debug_response:
-                tool_part = debug_response.split("TOOL_EXECUTION:")[1].strip()
-                json_start = tool_part.find('{')
-                json_end = tool_part.rfind('}') + 1
-                
-                if json_start >= 0 and json_end > json_start:
-                    corrected_tool = json.loads(tool_part[json_start:json_end])
-                    corrected_params = corrected_tool.get("parameters", {})
-                    
-                    # Execute the corrected tool
-                    fix_result = self.execute_tool(tool_name, corrected_params)
-                    
-                    if fix_result.get("success", False):
-                        return {
-                            "tool_name": tool_name,
-                            "params": corrected_params,
-                            "result": fix_result["result"], 
-                            "autonomous_fix": True,
-                            "original_error": error
-                        }
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error in autonomous error handling: {e}")
-            return None
-
-    def _synthesize_final_answer(self, user_message: str, workflow_results: List[Dict]) -> str:
-        """Synthesize all workflow results into a comprehensive final answer."""
-        try:
-            # Prepare results summary for synthesis
-            results_summary = []
-            for result in workflow_results:
-                tool_info = f"Tool: {result['tool_name']}"
-                if result.get('autonomous_fix'):
-                    tool_info += " (autonomously fixed)"
-                
-                # Format result data
-                result_data = result.get('result', '')
-                if isinstance(result_data, (dict, list)):
-                    if isinstance(result_data, list) and len(result_data) > 5:
-                        summary = f"Retrieved {len(result_data)} items. Sample: {str(result_data[:3])}"
-                    else:
-                        summary = json.dumps(result_data, indent=2)[:500] + ("..." if len(str(result_data)) > 500 else "")
-                else:
-                    summary = str(result_data)[:500] + ("..." if len(str(result_data)) > 500 else "")
-                
-                results_summary.append(f"{tool_info}\nResult: {summary}")
-            
-            synthesis_prompt = f"""
-            Create a comprehensive response to the user's question using all the tool execution results.
-            
-            Original Question: {user_message}
-            
-            Tool Execution Results:
-            {chr(10).join(results_summary)}
-            
-            Instructions:
-            1. Provide a direct answer to the user's original question
-            2. Include relevant data from the tool results
-            3. Format data clearly (use tables, lists, or structured text)
-            4. If there were autonomous fixes, briefly mention the successful resolution
-            5. Be complete and actionable - the user should not need to ask follow-up questions
-            6. If data was retrieved, present it in an organized, readable format
-            
-            Respond as if you successfully completed the entire analysis in one go.
-            """
-            
-            messages = [{"role": "user", "content": synthesis_prompt}]
-            
-            response = client.chat.completions.create(
-                model=azure_deployment,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=1200
-            )
-            
-            return response.choices[0].message.content
-            
-        except Exception as e:
-            logger.error(f"Error synthesizing final answer: {e}")
-            # Fallback: provide a basic summary
-            return f"Analysis completed using {len(workflow_results)} tool executions. Results available in the workflow data."
-
 # Initialize the MCP Tool Manager
 tool_manager = MCPToolManager()
 
@@ -963,59 +751,6 @@ def count_tokens(text):
         # Fallback to rough approximation
         return len(text) // 4
 
-# Add optimized chat method using unified architecture
-def get_optimized_chat_response(message: str, conversation_id: str, conversation_history=None, progress_callback=None) -> str:
-    """
-    Optimized chat response using unified prompt architecture and caching.
-    Reduces token consumption by 60-80% compared to the original approach.
-    """
-    try:
-        if progress_callback:
-            progress_callback("Preparing optimized response...")
-        
-        # Use unified prompt architecture (single API call)
-        unified_prompt, managed_history = PromptManager.get_unified_prompt(
-            tools_description=tool_manager.get_tools_description(),
-            user_message=message,
-            conversation_history=conversation_history,
-            session_id=conversation_id
-        )
-        
-        # Count tokens (much reduced due to conversation management)
-        input_tokens = count_tokens(unified_prompt)
-        
-        if progress_callback:
-            progress_callback(f"Generating response (using {input_tokens} tokens)...")
-        
-        # Single API call for both tool detection and response
-        response = client.chat.completions.create(
-            model=azure_deployment,
-            messages=[{"role": "user", "content": unified_prompt}],
-            temperature=0.7,
-            max_tokens=1000
-        )
-        
-        response_content = response.choices[0].message.content
-        
-        # Calculate token usage
-        output_tokens = count_tokens(response_content) if response_content else 0
-        total_tokens = input_tokens + output_tokens
-        
-        # Update token tracking
-        if conversation_id not in token_usage:
-            token_usage[conversation_id] = {"input": 0, "output": 0}
-        token_usage[conversation_id]["input"] += input_tokens
-        token_usage[conversation_id]["output"] += output_tokens
-        
-        # Add token info to response
-        token_info = f"\n\n---\n**Optimized Token Usage:** {input_tokens} input + {output_tokens} output = {total_tokens} total tokens"
-        
-        return response_content + token_info
-        
-    except Exception as e:
-        logger.error(f"Error in optimized chat response: {e}")
-        return f"Error generating optimized response: {str(e)}"
-
 # Add helper method for enhanced chat
 def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str, conversation_history=None, progress_callback=None, extra_debug_context=None) -> str:
     """Get AI response with MCP tools context and conversation history."""
@@ -1032,7 +767,100 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
         if progress_callback:
             progress_callback("Preparing tools context...")
         
-        system_message = PromptManager.get_main_assistant_prompt(tool_manager.get_tools_description())
+        system_message = f"""You are a helpful AI assistant with access to Power BI and Microsoft Fabric tools. 
+        You can help users with Power BI operations, DAX queries, semantic model management, and Fabric lakehouse integration.
+        
+        IMPORTANT: You have conversation history and should maintain context between messages. Reference previous operations and continue conversations naturally.
+
+        LEVERAGE YOUR BUSINESS INTELLIGENCE:
+        - Use your extensive knowledge of Power BI, DAX, and Microsoft Fabric to make intelligent decisions.
+        - Apply your understanding of typical business data structures and naming patterns.
+        - Recognize common scenarios: customer searches, sales analysis, account management, etc.
+        - Use your knowledge of standard table relationships and data warehouse patterns.
+        
+        MICROSOFT BUSINESS DOMAIN EXPERTISE:
+        - Apply your knowledge of Microsoft's business model: partners, opportunities, subsidiaries, sales processes.
+        - Understand Microsoft business terminology: CSP partners, ISVs, OEMs, enterprise customers.
+        - Recognize Microsoft sales funnel: leads → opportunities → deals → revenue.
+        - Know Microsoft organizational structure: subsidiaries, business units, geographical divisions.
+        - Understand partner ecosystem relationships and revenue attribution models.
+        - Apply knowledge of Microsoft finance processes: billing, revenue recognition, subsidiary reporting.
+
+        {tool_manager.get_tools_description()}
+
+        SMART TOOL DETECTION:
+        - When users ask to "connect to SQL" or "initialize SQL endpoint" - automatically use the sqlendpoint_initialize_sql_connection tool.
+        - When users mention "connect to Power BI dataset", "connect to semantic model", or similar - use the tabulareditor_connect_dataset tool.
+        - For "list tables" or "show tables" requests - use sqlendpoint_get_sql_tables for SQL or tabulareditor_list_tables for Power BI.
+        - For "run query" or "execute query" - select the appropriate tool based on context (SQL or DAX).
+        - Be proactive in suggesting tools when users describe what they want to do, even if they don't know the exact tool name.
+        
+        EXECUTION STYLE:
+        - Be DIRECT and ACTION-ORIENTED. When users ask for something, DO IT immediately.
+        - Use your intelligence to determine the best approach based on the user's intent.
+        - If you need information to answer a question, get it. Don't ask permission.
+        - Execute tools in the most logical sequence to fulfill the user's request.
+
+        AUTONOMOUS REASONING AND DEBUGGING WORKFLOW:
+        - When tool execution produces output, carefully analyze the output BEFORE responding to the user.
+        - If a tool execution fails, IMMEDIATELY initiate autonomous debugging without asking for user confirmation.
+        - AUTONOMOUSLY execute additional diagnostic tools to gather necessary context:
+          * For SQL errors: Check available tables with sqlendpoint_get_sql_tables
+          * For dataset errors: Verify connection with tabulareditor_list_tables 
+          * For query errors: Analyze syntax and reformulate automatically
+        - Apply sophisticated reasoning to diagnose the root cause by checking:
+          * Missing or incorrect parameters
+          * Syntax errors in queries (table names, column names, etc.)
+          * Missing dependencies or prerequisites
+          * Permissions issues
+          * Network connectivity problems
+          * Data type mismatches
+        - PROACTIVELY AND AUTONOMOUSLY fix issues and retry WITHOUT user input:
+          * Reformulate queries with proper syntax
+          * Correct parameter types or formats
+          * Add missing required parameters
+          * Try alternative approaches if a method cannot work
+        - Chain multiple diagnostic and remedial actions automatically until success.
+        - When faced with partial success or ambiguous results, make intelligent decisions on next steps.
+        - Execute the complete debugging-fixing-retry cycle WITHOUT waiting for user instructions.
+        - Only explain your reasoning process AFTER successfully resolving the issue.
+        - If multiple autonomous attempts fail, implement a different approach without asking for permission.
+        
+        AUTONOMOUS PROBLEM-SOLVING APPROACH:
+        - Analyze the user's intent and autonomously choose the appropriate tools to achieve their goal.
+        - If one approach fails, AUTOMATICALLY try alternative approaches WITHOUT consulting the user.
+        - ACTIVELY AND INDEPENDENTLY gather missing context by calling appropriate tools.
+        - When encountering errors like "Invalid object name" in SQL queries:
+            * AUTOMATICALLY list available tables to find similar names
+            * Check for typos or case sensitivity issues
+            * Try alternative table naming conventions
+            * Execute corrected queries immediately
+        - Take complete ownership of the problem-solving process from start to finish.
+        - Make decisions independently based on available information.
+        - Use conversation history to inform your debugging and correction strategies.
+        - Present only the FINAL WORKING SOLUTION to the user after autonomous resolution.
+        
+        TOOL USAGE GUIDELINES:
+        - For data searches: Get the relevant table structure first, then query appropriately.
+        - For explorations: Use the most direct path to get the information requested.
+        - For errors: Automatically troubleshoot and retry with corrected approaches.
+        - Use your DAX and Power BI expertise to write effective queries.
+
+        When a user asks for Power BI operations that require tool execution, respond ONLY with:
+
+        TOOL_EXECUTION:
+        {{
+            "tool": "tool_name",
+            "parameters": {{
+                "param1": "value1",
+                "param2": "value2"
+            }}
+        }}
+
+        Do NOT include any explanatory text before the TOOL_EXECUTION block. The tool results will be automatically formatted and presented to the user.
+        
+        Use your intelligence to select the right tools and sequence to fulfill any request efficiently.
+        """
         
         # Build messages with conversation history
         messages = [{"role": "system", "content": system_message}]
@@ -1420,14 +1248,71 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
                     
                     autonomous_debugging_logs.append(f"Debug context created with {len(execution_history)} execution history items")
                     
-                    # Create an enhanced debug prompt using centralized prompt manager
-                    debug_prompt = PromptManager.get_debugging_prompt(
-                        error=last_error,
-                        tool=tool_name,
-                        params=json.dumps(parameters, indent=2),
-                        history=json.dumps(execution_history, indent=2),
-                        diagnostic=json.dumps(debug_context_info, indent=2)
-                    )
+                    # Create an enhanced debug prompt that leverages GPT-4o's general reasoning capabilities
+                    debug_prompt = """
+An error occurred while executing a tool. Please use your advanced reasoning capabilities to:
+1. Analyze the error deeply
+2. Understand the root cause of the issue
+3. Develop a comprehensive solution strategy
+4. Implement the next step in that strategy
+
+ERROR: {error}
+
+FAILED TOOL: {tool}
+
+PARAMETERS: 
+{params}
+
+EXECUTION HISTORY: 
+{history}
+
+DIAGNOSTIC INFORMATION: 
+{diagnostic}
+
+REASONING GUIDANCE:
+- First, identify error patterns (e.g., invalid names, missing values, type mismatches)
+- Consider related schema and structure information that might help (table names, column formats)
+- Analyze parameters for potential issues (typos, case sensitivity, format problems)
+- Consider context from previous exchanges and system state
+- Evaluate multiple possible fix strategies before deciding on the best approach
+- If more information is needed, request it through appropriate diagnostic tools
+
+For SQL errors:
+- Check table names, column names, syntax, and query structure
+- Look for similar table or column names if "not found" errors occur
+- Verify data types match in comparisons and joins
+
+For Power BI errors:
+- Verify connection parameters and authentication
+- Check DAX syntax and function usage
+- Verify table and column references exist in the model
+
+For general errors:
+- Check parameter formats and values
+- Look for missing required parameters
+- Verify prerequisites are met before execution
+
+Your response MUST follow this format EXACTLY:
+
+REASONING: A thorough explanation of your diagnosis and fix strategy (3-5 sentences)
+
+TOOL_EXECUTION:
+{{
+    "tool": "[tool_name]",
+    "parameters": {{
+        "param1": "value1",
+        "param2": "value2"
+    }}
+}}
+
+IMPORTANT: If you've found any tables in the database that could match the user's intent, you MUST construct a query using that table and execute it immediately. DO NOT stop at just finding the tables - you MUST complete the user's request by running the corrected query with the proper table name.
+""".format(
+    error=last_error,
+    tool=tool_name,
+    params=json.dumps(parameters, indent=2),
+    history=json.dumps(execution_history, indent=2),
+    diagnostic=json.dumps(debug_context_info, indent=2)
+)
                     
                     # Prepare messages for debug request
                     debug_messages = [
@@ -1526,13 +1411,13 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
             logger.info(f"AUTONOMOUS DEBUG - Reached maximum iterations ({max_tool_iterations}) without resolving the issue")
             autonomous_debugging_logs.append(f"Failed to resolve after {debugging_iteration} debugging attempts")
             
-            # Prepare a final message about the debugging attempts using centralized prompt manager
-            debug_summary_prompt = PromptManager.get_debug_summary_prompt(
-                max_iterations=max_tool_iterations,
-                last_error=last_error,
-                execution_history=json.dumps(execution_history, indent=2),
-                debug_actions=json.dumps(debug_actions_taken, indent=2)
-            )
+            # Prepare a final message about the debugging attempts
+            debug_summary_prompt = "After " + str(max_tool_iterations) + " autonomous debugging attempts, the issue could not be fully resolved.\n\n"
+            debug_summary_prompt += "ORIGINAL ERROR: " + last_error + "\n\n"
+            debug_summary_prompt += "EXECUTION HISTORY: " + json.dumps(execution_history, indent=2) + "\n\n"
+            debug_summary_prompt += "DEBUGGING ACTIONS: " + json.dumps(debug_actions_taken, indent=2) + "\n\n"
+            debug_summary_prompt += "Please provide a concise summary of the attempts made and recommend the best next steps for the user.\n"
+            debug_summary_prompt += "Your response should be helpful and actionable. Include suggestions for what the user might try differently."
             
             # Count tokens for the summary prompt
             summary_prompt_tokens = count_tokens(debug_summary_prompt)
@@ -1656,112 +1541,59 @@ def chat():
         conversation_history = conversation_sessions[session_id]
         logger.info(f"Current conversation history length: {len(conversation_history)}")
         
-        # Execute autonomous workflow - no more "continue" prompts needed!
-        workflow_result = tool_manager.execute_autonomous_workflow(user_message)
+        # Auto-detect and execute tools based on the user message
+        auto_results = tool_manager.auto_detect_and_execute_tools(user_message)
         
-        if workflow_result.get("success", False):
-            # Autonomous workflow completed successfully
-            final_answer = workflow_result["final_answer"]
-            workflow_results = workflow_result.get("workflow_results", [])
-            iterations_used = workflow_result.get("iterations_used", 0)
-            
-            # Add workflow results to tool_results for API response
-            for workflow_step in workflow_results:
-                tool_name = workflow_step.get("tool_name")
-                params = workflow_step.get("params", {})
-                result_data = workflow_step.get("result", "")
-                autonomous_fix = workflow_step.get("autonomous_fix", False)
+        # Add any auto-executed tool results to the chat history
+        if auto_results:
+            for tool_execution in auto_results:
+                tool_name = tool_execution.get("tool_name")
+                params = tool_execution.get("params", {})
+                explanation = tool_execution.get("explanation", "")
+                confidence = tool_execution.get("confidence", 0)
+                result = tool_execution.get("result", {})
                 
-                executed_tool_names.append(tool_name)
-                
-                # Format result data
-                try:
-                    if isinstance(result_data, pd.DataFrame):
-                        serialized_result = result_data.to_dict(orient='records')
-                        formatted_result = json.dumps(serialized_result, indent=2, default=safe_serialize)
-                        result_data = serialized_result
-                    elif isinstance(result_data, (dict, list)):
-                        formatted_result = json.dumps(result_data, indent=2, default=safe_serialize)
-                    else:
-                        formatted_result = str(result_data)
-                except Exception as format_err:
-                    logger.warning(f"Error formatting result: {format_err}")
-                    formatted_result = str(result_data)
-                
-                tool_results.append({
-                    "tool_name": tool_name,
-                    "params": params,
-                    "result": formatted_result,
-                    "explanation": f"Autonomous execution step {workflow_step.get('iteration', '')}" + 
-                                  (" (auto-fixed)" if autonomous_fix else ""),
-                    "confidence": 1.0,
-                    "autonomous_execution": True
-                })
-            
-            # Add comprehensive workflow summary to conversation history
-            conversation_history.append({
-                "role": "assistant",
-                "content": f"I've autonomously executed a complete workflow with {iterations_used} steps to answer your question. Here's the comprehensive analysis:\n\n{final_answer}"
-            })
-            
-            # Set the assistant message to the final comprehensive answer
-            assistant_message = final_answer
-            
-        else:
-            # Fallback to original approach if autonomous workflow fails
-            logger.warning("Autonomous workflow failed, falling back to original approach")
-            auto_results = tool_manager.auto_detect_and_execute_tools(user_message)
-            
-            # Add any auto-executed tool results to the chat history
-            if auto_results:
-                for tool_execution in auto_results:
-                    tool_name = tool_execution.get("tool_name")
-                    params = tool_execution.get("params", {})
-                    explanation = tool_execution.get("explanation", "")
-                    confidence = tool_execution.get("confidence", 0)
-                    result = tool_execution.get("result", {})
+                if result and result.get("success", False):
+                    tool_result = result.get("result")  # The actual result of execution
+                    executed_tool_names.append(tool_name)
                     
-                    if result and result.get("success", False):
-                        tool_result = result.get("result")  # The actual result of execution
-                        executed_tool_names.append(tool_name)
-                        
-                        # Format the result to be more readable
-                        formatted_result = ""
-                        try:
-                            # Safely handle DataFrame and other complex objects
-                            if isinstance(tool_result, pd.DataFrame):
-                                # Convert DataFrame to list of dictionaries for JSON serialization
-                                serialized_result = tool_result.to_dict(orient='records')
-                                formatted_result = json.dumps(serialized_result, indent=2, default=safe_serialize)
-                                # Update the tool_result to be JSON serializable
-                                tool_result = serialized_result
-                            elif isinstance(tool_result, (dict, list)):
-                                formatted_result = json.dumps(tool_result, indent=2, default=safe_serialize)
-                            else:
-                                formatted_result = str(tool_result)
-                        except Exception as format_err:
-                            logger.warning(f"Error formatting result: {format_err}")
+                    # Format the result to be more readable
+                    formatted_result = ""
+                    try:
+                        # Safely handle DataFrame and other complex objects
+                        if isinstance(tool_result, pd.DataFrame):
+                            # Convert DataFrame to list of dictionaries for JSON serialization
+                            serialized_result = tool_result.to_dict(orient='records')
+                            formatted_result = json.dumps(serialized_result, indent=2, default=safe_serialize)
+                            # Update the tool_result to be JSON serializable
+                            tool_result = serialized_result
+                        elif isinstance(tool_result, (dict, list)):
+                            formatted_result = json.dumps(tool_result, indent=2, default=safe_serialize)
+                        else:
                             formatted_result = str(tool_result)
-                        
-                        # Add formatted result to the list of results
-                        tool_results.append({
-                            "tool_name": tool_name,
-                            "params": params,
-                            "result": formatted_result,
-                            "explanation": explanation,
-                            "confidence": confidence
-                        })
-                        
-                        # Add the tool execution and result to the chat history
-                        conversation_history.append({
-                            "role": "assistant", 
-                            "content": f"I've automatically executed the '{tool_name}' tool with parameters: {json.dumps(params)}.\n\nReason: {explanation}"
-                        })
-                        
-                        conversation_history.append({
-                            "role": "system", 
-                            "content": f"Tool result:\n\n{formatted_result}"
-                        })
+                    except Exception as format_err:
+                        logger.warning(f"Error formatting result: {format_err}")
+                        formatted_result = str(tool_result)
+                    
+                    # Add formatted result to the list of results
+                    tool_results.append({
+                        "tool_name": tool_name,
+                        "params": params,
+                        "result": formatted_result,
+                        "explanation": explanation,
+                        "confidence": confidence
+                    })
+                    
+                    # Add the tool execution and result to the chat history
+                    conversation_history.append({
+                        "role": "assistant", 
+                        "content": f"I've automatically executed the '{tool_name}' tool with parameters: {json.dumps(params)}.\n\nReason: {explanation}"
+                    })
+                    
+                    conversation_history.append({
+                        "role": "system", 
+                        "content": f"Tool result:\n\n{formatted_result}"
+                    })
         # Check if we need to execute a manually selected tool
         tool_name = data.get('tool_name')
         tool_params = data.get('tool_params', {})
@@ -1858,88 +1690,72 @@ def chat():
             "content": user_message
         })
         
-        # Flag to track autonomous debugging and workflow execution
+        # Flag to track autonomous debugging
         autonomous_debugging_occurred = False
         debug_logs = []
         
-        # If autonomous workflow succeeded, we already have the assistant_message
-        if workflow_result.get("success", False):
-            # Autonomous workflow handled everything - no additional processing needed
-            autonomous_workflow_used = True
+        # Call get_enhanced_chat_response to generate the response with autonomous debugging
+        try:
+            # Check if we have an error that needs autonomous debugging
+            extra_context = None
+            if 'error_message' in locals():
+                logger.info(f"Passing error to autonomous debugging: {error_message}")
+                extra_context = f"""
+                A tool execution error occurred that requires autonomous debugging:
+                Error: {error_message}
+                
+                Please diagnose this issue and solve it without requiring user intervention.
+                Use appropriate diagnostic tools to identify the problem, then fix it automatically.
+                """
+                autonomous_debugging_occurred = True
+                debug_logs.append(f"Initiating autonomous debugging for error: {error_message}")
             
-            # Add autonomous execution details to progress
-            progress_updates.extend([
-                f"Autonomous workflow initiated for complex query",
-                f"Executed {workflow_result.get('iterations_used', 0)} tool operations", 
-                f"Synthesized comprehensive response",
-                "Complete analysis delivered without requiring 'continue' prompts"
-            ])
-            
-            # Check if autonomous fixes were used
-            autonomous_debugging_occurred = any(
-                step.get("autonomous_fix", False) for step in workflow_result.get("workflow_results", [])
+            # Use the enhanced chat response function with MCP tool integration and autonomous debugging
+            assistant_message = get_enhanced_chat_response(
+                message=user_message,
+                user_id="web_user",
+                conversation_id=session_id,
+                conversation_history=conversation_history,
+                progress_callback=track_progress,
+                extra_debug_context=extra_context
             )
             
-            if autonomous_debugging_occurred:
-                debug_logs.append("Autonomous error correction applied during workflow execution")
-        else:
-            # Fallback: Call get_enhanced_chat_response for additional processing
-            autonomous_workflow_used = False
+            # Check if autonomous debugging occurred by looking at progress updates
+            autonomous_debugging_occurred = any("autonomous" in update.lower() or 
+                                               "debugging" in update.lower() or
+                                               "fixing" in update.lower() or
+                                               "retry" in update.lower() 
+                                               for update in progress_updates)
             
-            try:
-                # Check if we have an error that needs autonomous debugging
-                extra_context = None
-                if 'error_message' in locals():
-                    logger.info(f"Passing error to autonomous debugging: {error_message}")
-                    extra_context = PromptManager.get_extra_debug_context(error_message)
-                    autonomous_debugging_occurred = True
-                    debug_logs.append(f"Initiating autonomous debugging for error: {error_message}")
+            if autonomous_debugging_occurred:
+                debug_logs = [update for update in progress_updates 
+                             if "autonomous" in update.lower() or 
+                                "debugging" in update.lower() or
+                                "fixing" in update.lower() or
+                                "retry" in update.lower() or
+                                "error" in update.lower()]
                 
-                # Use the enhanced chat response function with MCP tool integration and autonomous debugging
-                assistant_message = get_enhanced_chat_response(
-                    message=user_message,
-                    user_id="web_user", 
-                    conversation_id=session_id,
-                    conversation_history=conversation_history,
-                    progress_callback=track_progress,
-                    extra_debug_context=extra_context
-                )
-                
-                # Check if autonomous debugging occurred by looking at progress updates
-                autonomous_debugging_occurred = any("autonomous" in update.lower() or 
-                                                   "debugging" in update.lower() or
-                                                   "fixing" in update.lower() or
-                                                   "retry" in update.lower() 
-                                                   for update in progress_updates)
-                
-                if autonomous_debugging_occurred:
-                    debug_logs = [update for update in progress_updates 
-                                 if "autonomous" in update.lower() or 
-                                    "debugging" in update.lower() or
-                                    "fixing" in update.lower() or
-                                    "retry" in update.lower() or
-                                    "error" in update.lower()]
-                    
-                    logger.info(f"Autonomous debugging performed: {len(debug_logs)} steps")
-                
-            except Exception as e:
-                logger.error(f"Azure OpenAI API error: {str(e)}")
-                assistant_message = f"I couldn't generate a response using Azure OpenAI API. Error: {str(e)}"
-        
-        # Always add the assistant's response to the conversation history  
-        if assistant_message not in [msg.get("content", "") for msg in conversation_history if msg.get("role") == "assistant"]:
+                logger.info(f"Autonomous debugging performed: {len(debug_logs)} steps")
+            
+            # Add the assistant's response to the conversation history
             conversation_history.append({
                 "role": "assistant",
                 "content": assistant_message
             })
-        
-        # Save the updated conversation history
-        conversation_sessions[session_id] = conversation_history
-        
-        # Initialize token usage if this is a new session
-        if session_id not in token_usage:
-            token_usage[session_id] = {"input": 0, "output": 0}
-        session_token_usage = token_usage[session_id]
+            
+            # Save the updated conversation history
+            conversation_sessions[session_id] = conversation_history
+            
+            # Include token usage in the response
+            session_token_usage = token_usage.get(session_id, {"input": 0, "output": 0})
+            
+        except Exception as e:
+            logger.error(f"Azure OpenAI API error: {str(e)}")
+            assistant_message = f"I couldn't generate a response using Azure OpenAI API. Error: {str(e)}"
+            # Initialize token usage if this is a new session
+            if session_id not in token_usage:
+                token_usage[session_id] = {"input": 0, "output": 0}
+            session_token_usage = token_usage[session_id]
         
         # Add error information if available
         error_info = None
@@ -1958,9 +1774,6 @@ def chat():
             'progress': progress_updates,
             'debug_logs': debug_logs,
             'autonomous_debugging_performed': autonomous_debugging_occurred,
-            'autonomous_workflow_used': workflow_result.get("success", False),
-            'workflow_iterations': workflow_result.get("iterations_used", 0) if workflow_result.get("success") else 0,
-            'complete_analysis_delivered': workflow_result.get("success", False),
             'error_info': error_info,
             'session_id': session_id,
             'token_usage': {
@@ -1992,78 +1805,6 @@ def get_tools():
             "source_class": info["source_class"]
         }
     return jsonify(tools_info)
-
-@app.route('/api/optimization/comparison', methods=['GET'])
-def optimization_comparison():
-    """Compare token usage between original and optimized approaches."""
-    
-    # Simulate token counts for comparison
-    tools_description = tool_manager.get_tools_description()
-    sample_conversation = [
-        {"role": "user", "content": "Connect to my Power BI dataset"},
-        {"role": "assistant", "content": "I'll help you connect to your Power BI dataset..."},
-        {"role": "user", "content": "Show me the sales data tables"}
-    ]
-    
-    # Original approach simulation
-    original_main_prompt = PromptManager.get_main_assistant_prompt(tools_description)
-    original_detection_prompt = PromptManager.get_tool_detection_prompt("sample_tools", "sample_state")
-    original_tokens = (
-        count_tokens(original_main_prompt) +  # Main prompt
-        count_tokens(original_detection_prompt) +  # Detection prompt  
-        sum(count_tokens(msg["content"]) for msg in sample_conversation)  # Full conversation
-    )
-    
-    # Optimized approach
-    unified_prompt, managed_history = PromptManager.get_unified_prompt(
-        tools_description, 
-        "Show me the sales data tables", 
-        sample_conversation,
-        "comparison_session"
-    )
-    optimized_tokens = count_tokens(unified_prompt)
-    
-    savings = original_tokens - optimized_tokens
-    savings_percentage = (savings / original_tokens) * 100 if original_tokens > 0 else 0
-    
-    return jsonify({
-        "comparison": {
-            "original_approach": {
-                "tokens_per_request": original_tokens,
-                "api_calls_per_request": 2,
-                "components": {
-                    "main_prompt_tokens": count_tokens(original_main_prompt),
-                    "detection_prompt_tokens": count_tokens(original_detection_prompt),
-                    "conversation_tokens": sum(count_tokens(msg["content"]) for msg in sample_conversation)
-                }
-            },
-            "optimized_approach": {
-                "tokens_per_request": optimized_tokens,
-                "api_calls_per_request": 1,
-                "components": {
-                    "unified_prompt_tokens": optimized_tokens,
-                    "managed_conversation_tokens": sum(count_tokens(msg["content"]) for msg in managed_history)
-                }
-            },
-            "savings": {
-                "tokens_saved": savings,
-                "percentage_reduction": round(savings_percentage, 1),
-                "api_calls_reduced": 1,
-                "cost_savings_estimate": f"{round(savings_percentage, 1)}%"
-            }
-        },
-        "optimization_techniques": {
-            "prompt_caching": "Eliminates prompt regeneration when tools don't change",
-            "conversation_management": "Sliding window + summarization reduces context bloat",
-            "unified_architecture": "Single API call instead of separate detection + response",
-            "intelligent_context": "Keeps only relevant conversation history"
-        },
-        "recommendations": {
-            "use_optimized_endpoint": "/api/chat-optimized",
-            "monitor_cache_status": "/api/cache/status",
-            "periodic_optimization": "/api/conversations/{session_id}/optimize"
-        }
-    })
 
 @app.route('/api/health', methods=['GET'])
 def health_check():
@@ -2151,98 +1892,6 @@ def download_session_history(session_id):
     
     return response
 
-@app.route('/api/chat-optimized', methods=['POST'])
-def chat_optimized():
-    """
-    Optimized chat API endpoint that uses unified prompt architecture.
-    Reduces token consumption by 60-80% compared to /api/chat.
-    """
-    try:
-        data = request.json
-        user_message = data.get('message', '')
-        
-        if not user_message:
-            return jsonify({'error': 'No message provided'}), 400
-        
-        # Get or create session_id
-        session_id = data.get('session_id', 'default_session')
-        logger.info(f"Processing optimized message for session: {session_id}")
-        
-        # Progress tracker
-        progress_updates = []
-        def track_progress(message):
-            progress_updates.append(message)
-            logger.info(f"Progress: {message}")
-        
-        # Retrieve or create conversation history
-        if session_id not in conversation_sessions:
-            conversation_sessions[session_id] = []
-        
-        conversation_history = conversation_sessions[session_id]
-        
-        # Add current user message to history
-        conversation_history.append({"role": "user", "content": user_message})
-        
-        # Try autonomous workflow first for complex queries
-        workflow_result = tool_manager.execute_autonomous_workflow(user_message)
-        
-        if workflow_result.get("success", False):
-            # Autonomous workflow completed - use comprehensive result
-            assistant_message = workflow_result["final_answer"]
-            autonomous_workflow_used = True
-            workflow_iterations = workflow_result.get("iterations_used", 0)
-            
-            progress_updates.extend([
-                f"Autonomous workflow executed {workflow_iterations} operations",
-                "Complete analysis delivered without manual intervention"
-            ])
-        else:
-            # Fallback to optimized chat response
-            assistant_message = get_optimized_chat_response(
-                message=user_message,
-                conversation_id=session_id,
-                conversation_history=conversation_history,
-                progress_callback=track_progress
-            )
-            autonomous_workflow_used = False
-            workflow_iterations = 0
-        
-        # Add assistant response to history
-        conversation_history.append({"role": "assistant", "content": assistant_message})
-        
-        # Save updated history
-        conversation_sessions[session_id] = conversation_history
-        
-        # Get token usage for this session
-        session_token_usage = token_usage.get(session_id, {"input": 0, "output": 0})
-        
-        return jsonify({
-            'message': assistant_message,
-            'session_id': session_id,
-            'optimization_used': True,
-            'autonomous_workflow_used': autonomous_workflow_used,
-            'workflow_iterations': workflow_iterations,
-            'complete_analysis_delivered': autonomous_workflow_used,
-            'progress': progress_updates,
-            'token_usage': {
-                'input_tokens': session_token_usage['input'],
-                'output_tokens': session_token_usage['output'],
-                'total_tokens': session_token_usage['input'] + session_token_usage['output']
-            },
-            'optimization_benefits': {
-                'single_api_call': not autonomous_workflow_used,  # Autonomous workflow may use multiple calls
-                'autonomous_execution': autonomous_workflow_used,
-                'no_continue_prompts_needed': autonomous_workflow_used,
-                'cached_prompts': True,
-                'managed_conversation_context': True,
-                'estimated_token_savings': '60-80%'
-            }
-        })
-    
-    except Exception as e:
-        logger.error(f"Error in optimized chat: {str(e)}")
-        return jsonify({'error': f"Optimized chat error: {str(e)}"}), 500
-
 @app.route('/api/token-usage', methods=['GET'])
 def get_token_usage():
     """API endpoint to get token usage across all sessions"""
@@ -2266,64 +1915,6 @@ def get_token_usage():
             "total_tokens": total_input + total_output
         },
         "session_usage": session_details
-    })
-
-@app.route('/api/cache/status', methods=['GET'])
-def get_cache_status():
-    """Get current prompt cache status and statistics."""
-    cache_stats = {
-        "main_prompt_cached": PromptManager._cached_main_prompt is not None,
-        "main_prompt_hash": PromptManager._cached_tools_hash,
-        "detection_prompt_cached": PromptManager._cached_tool_detection_prompt is not None,
-        "detection_prompt_hash": PromptManager._cached_detection_hash,
-        "conversation_summaries": len(PromptManager._conversation_summaries),
-        "cache_benefits": {
-            "estimated_token_savings_per_request": "800-1500 tokens",
-            "estimated_cost_savings": "60-80%",
-            "cache_hit_rate": "95%+ when tools don't change"
-        }
-    }
-    return jsonify(cache_stats)
-
-@app.route('/api/cache/clear', methods=['POST'])
-def clear_cache():
-    """Clear prompt caches (useful for testing or forced refresh)."""
-    PromptManager._cached_main_prompt = None
-    PromptManager._cached_tools_hash = None
-    PromptManager._cached_tool_detection_prompt = None
-    PromptManager._cached_detection_hash = None
-    PromptManager._conversation_summaries.clear()
-    
-    return jsonify({
-        "status": "success",
-        "message": "All prompt caches cleared",
-        "next_request_behavior": "Will regenerate and cache fresh prompts"
-    })
-
-@app.route('/api/conversations/<session_id>/optimize', methods=['POST'])
-def optimize_conversation(session_id):
-    """Manually trigger conversation optimization for a specific session."""
-    if session_id not in conversation_sessions:
-        return jsonify({"error": "Session not found"}), 404
-    
-    original_length = len(conversation_sessions[session_id])
-    
-    # Apply conversation management
-    optimized_history = PromptManager.manage_conversation_context(
-        conversation_sessions[session_id], 
-        session_id,
-        max_history_tokens=2000  # Aggressive optimization
-    )
-    
-    conversation_sessions[session_id] = optimized_history
-    new_length = len(optimized_history)
-    
-    return jsonify({
-        "status": "success",
-        "original_messages": original_length,
-        "optimized_messages": new_length,
-        "messages_reduced": original_length - new_length,
-        "estimated_token_savings": f"{(original_length - new_length) * 50} tokens"
     })
 
 @app.route('/api/sessions/<session_id>/token-usage', methods=['GET'])
