@@ -3,16 +3,13 @@ import sys
 import json
 import logging
 import inspect
-import datetime
-import tiktoken
 from typing import Dict, Any, List, Optional, Union, Callable
 import asyncio
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from azure.identity import AzureCliCredential
 from openai import AzureOpenAI
 from dotenv import load_dotenv
-import pandas as pd
 
 # Add parent directory to path to import from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -84,19 +81,9 @@ try:
         api_version=api_version
     )
     logger.info(f"Successfully initialized Azure OpenAI client with Azure CLI token for endpoint {azure_endpoint}")
-    
-    # Initialize the tiktoken encoder for GPT-4o
-    try:
-        # For Azure OpenAI, we need to use the cl100k_base encoding for GPT-4o
-        encoding = tiktoken.get_encoding("cl100k_base")
-        logger.info("Successfully initialized tiktoken encoder for token counting")
-    except Exception as e:
-        logger.error(f"Error initializing tiktoken encoder: {e}")
-        encoding = None
 except Exception as e:
     logger.error(f"Error initializing Azure OpenAI client: {e}")
     client = None
-    encoding = None
     raise RuntimeError(f"Failed to initialize Azure OpenAI client: {e}")
 
 class MCPToolManager:
@@ -706,62 +693,13 @@ For any GUID in the message, consider if it might be a workspace_identifier or d
 # Initialize the MCP Tool Manager
 tool_manager = MCPToolManager()
 
-# Utility function to safely serialize objects (including DataFrames)
-def safe_serialize(obj):
-    """Safely serialize objects including pandas DataFrames and other complex objects"""
-    import pandas as pd
-    import io
-    
-    if isinstance(obj, pd.DataFrame):
-        # If it's a small DataFrame, convert to records
-        if len(obj) <= 100:
-            return obj.to_dict(orient='records')
-        else:
-            # For larger DataFrames, provide a summary and limited records
-            csv_buffer = io.StringIO()
-            obj.head(50).to_csv(csv_buffer, index=False)
-            return {
-                "_type": "DataFrame",
-                "shape": obj.shape,
-                "columns": list(obj.columns),
-                "dtypes": {col: str(dtype) for col, dtype in obj.dtypes.items()},
-                "sample_data": obj.head(50).to_dict(orient='records'),
-                "summary": f"DataFrame with {obj.shape[0]} rows and {obj.shape[1]} columns. Showing first 50 rows."
-            }
-    elif hasattr(obj, 'to_dict'):
-        return obj.to_dict()
-    elif hasattr(obj, '__dict__'):
-        return obj.__dict__
-    else:
-        return str(obj)
-
-# Token counting function for GPT-4o
-def count_tokens(text):
-    """Count the number of tokens in a string using tiktoken"""
-    if encoding is None:
-        # If encoding isn't available, estimate tokens (very rough approximation)
-        return len(text) // 4  # Rough approximation: 1 token ≈ 4 characters
-    
-    try:
-        # Encode the text and count tokens
-        token_ids = encoding.encode(text)
-        return len(token_ids)
-    except Exception as e:
-        logger.error(f"Error counting tokens: {e}")
-        # Fallback to rough approximation
-        return len(text) // 4
-
 # Add helper method for enhanced chat
-def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str, conversation_history=None, progress_callback=None, extra_debug_context=None) -> str:
+def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str, conversation_history=None, progress_callback=None) -> str:
     """Get AI response with MCP tools context and conversation history."""
     try:
         # Use provided conversation history or start with empty list
         if conversation_history is None:
             conversation_history = []
-        
-        # Initialize token counters for this request
-        input_tokens = 0
-        output_tokens = 0
         
         # Always provide tools context - let GPT-4o decide when to use them
         if progress_callback:
@@ -801,44 +739,11 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
         - If you need information to answer a question, get it. Don't ask permission.
         - Execute tools in the most logical sequence to fulfill the user's request.
 
-        AUTONOMOUS REASONING AND DEBUGGING WORKFLOW:
-        - When tool execution produces output, carefully analyze the output BEFORE responding to the user.
-        - If a tool execution fails, IMMEDIATELY initiate autonomous debugging without asking for user confirmation.
-        - AUTONOMOUSLY execute additional diagnostic tools to gather necessary context:
-          * For SQL errors: Check available tables with sqlendpoint_get_sql_tables
-          * For dataset errors: Verify connection with tabulareditor_list_tables 
-          * For query errors: Analyze syntax and reformulate automatically
-        - Apply sophisticated reasoning to diagnose the root cause by checking:
-          * Missing or incorrect parameters
-          * Syntax errors in queries (table names, column names, etc.)
-          * Missing dependencies or prerequisites
-          * Permissions issues
-          * Network connectivity problems
-          * Data type mismatches
-        - PROACTIVELY AND AUTONOMOUSLY fix issues and retry WITHOUT user input:
-          * Reformulate queries with proper syntax
-          * Correct parameter types or formats
-          * Add missing required parameters
-          * Try alternative approaches if a method cannot work
-        - Chain multiple diagnostic and remedial actions automatically until success.
-        - When faced with partial success or ambiguous results, make intelligent decisions on next steps.
-        - Execute the complete debugging-fixing-retry cycle WITHOUT waiting for user instructions.
-        - Only explain your reasoning process AFTER successfully resolving the issue.
-        - If multiple autonomous attempts fail, implement a different approach without asking for permission.
-        
-        AUTONOMOUS PROBLEM-SOLVING APPROACH:
-        - Analyze the user's intent and autonomously choose the appropriate tools to achieve their goal.
-        - If one approach fails, AUTOMATICALLY try alternative approaches WITHOUT consulting the user.
-        - ACTIVELY AND INDEPENDENTLY gather missing context by calling appropriate tools.
-        - When encountering errors like "Invalid object name" in SQL queries:
-            * AUTOMATICALLY list available tables to find similar names
-            * Check for typos or case sensitivity issues
-            * Try alternative table naming conventions
-            * Execute corrected queries immediately
-        - Take complete ownership of the problem-solving process from start to finish.
-        - Make decisions independently based on available information.
-        - Use conversation history to inform your debugging and correction strategies.
-        - Present only the FINAL WORKING SOLUTION to the user after autonomous resolution.
+        PROBLEM-SOLVING APPROACH:
+        - Analyze the user's intent and choose the appropriate tools to achieve their goal.
+        - If one approach fails, automatically try alternative approaches.
+        - Use context from conversation history to make better decisions.
+        - Apply your business knowledge to understand the user's needs and provide relevant insights.
         
         TOOL USAGE GUIDELINES:
         - For data searches: Get the relevant table structure first, then query appropriately.
@@ -872,24 +777,9 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
                     "role": msg["role"],
                     "content": msg["content"]
                 })
-                # Count tokens in conversation history
-                input_tokens += count_tokens(msg["content"])
         
         # Add the current user message
         messages.append({"role": "user", "content": message})
-        # Count tokens in the current message
-        input_tokens += count_tokens(message)
-        
-        # Count tokens in the system message
-        input_tokens += count_tokens(system_message)
-        
-        # Add extra debug context if provided
-        if extra_debug_context:
-            messages.append({"role": "system", "content": extra_debug_context})
-            if progress_callback:
-                progress_callback("Adding debugging context for autonomous resolution...")
-            # Count tokens in the debug context
-            input_tokens += count_tokens(extra_debug_context)
         
         if progress_callback:
             progress_callback("Generating AI response...")
@@ -901,60 +791,18 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
                 messages=messages,
                 temperature=0.7,
                 max_tokens=1000
-            )
-            # Get the completion choice
-            choice = response.choices[0]
-            # Extract the message content
-            response_content = choice.message.content
-            
-            # Update token counts from the response
-            if hasattr(response, 'usage'):
-                # Get accurate token counts from the API response
-                if hasattr(response.usage, 'prompt_tokens'):
-                    input_tokens = response.usage.prompt_tokens
-                if hasattr(response.usage, 'completion_tokens'):
-                    output_tokens = response.usage.completion_tokens
-            else:
-                # If usage info isn't available, estimate output tokens
-                output_tokens = count_tokens(response_content)
+            ).choices[0].message.content
         except Exception as e:
             logger.error(f"Error calling OpenAI API: {e}")
             return f"Error calling OpenAI API: {e}"
         
-        # Handle tool execution with autonomous debugging and retry capabilities
-        max_tool_iterations = 10  # Prevent infinite loops
-        tool_iteration = 0
-        execution_history = []
-        has_failures = False
-        last_error = None
-        autonomous_debugging_active = False
-        debug_actions_taken = []
-        
-        # Token tracking for tool executions
-        tool_input_tokens = 0
-        tool_output_tokens = 0
-            
-        # Process tool executions and handle failures with autonomous debugging
-        autonomous_debugging_logs = []
-        debugging_iteration = 0
-        debug_context_info = {}  # Store detailed debug context for user explanation
-        
-        while "TOOL_EXECUTION:" in response_content and tool_iteration < max_tool_iterations:
-            tool_iteration += 1
-            
-            if autonomous_debugging_active:
-                debugging_iteration += 1
-                autonomous_debugging_logs.append(f"Debug iteration {debugging_iteration}: Processing next tool execution")
-            
+        # Check if the response contains a tool execution request
+        if "TOOL_EXECUTION:" in response:
             if progress_callback:
-                progress_callback(f"Tool execution iteration {tool_iteration} of {max_tool_iterations}...")
+                progress_callback("Tool execution requested...")
             
-            logger.info(f"AUTONOMOUS DEBUG - Processing tool iteration {tool_iteration}, debugging_active={autonomous_debugging_active}")
-            
-            # Extract any text before TOOL_EXECUTION and only keep the clean result
-            tool_part = response_content.split("TOOL_EXECUTION:")[1].strip()
-            
-            # Wrap the entire tool execution process in a try-except block
+            # Remove any text before TOOL_EXECUTION and only keep the clean result
+            tool_part = response.split("TOOL_EXECUTION:")[1].strip()
             try:
                 # Extract JSON from the response
                 json_start = tool_part.find('{')
@@ -965,89 +813,13 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
                 tool_name = tool_request.get("tool")
                 parameters = tool_request.get("parameters", {})
                 
-                logger.info(f"AUTONOMOUS DEBUG - Executing tool: {tool_name} with parameters: {parameters}")
-                
-                # Special handling for table schema tools - capture the table name
-                if tool_name == "sqlendpoint_get_sql_table_schema" and "table_name" in parameters:
-                    debug_context_info["last_table_name"] = parameters.get("table_name")
-                
-                # Track query changes for better user explanation
-                if tool_name == "sqlendpoint_execute_sql_query" and "query" in parameters:
-                    current_query = parameters.get("query", "")
-                    
-                    # Check if we've seen a failed query before
-                    if "previous_failed_query" in debug_context_info:
-                        prev_query = debug_context_info["previous_failed_query"]
-                        
-                        # Compare queries to identify what was changed
-                        import difflib
-                        
-                        # Generate a unified diff
-                        diff = list(difflib.unified_diff(
-                            prev_query.splitlines(),
-                            current_query.splitlines(),
-                            lineterm='',
-                            n=0  # No context lines
-                        ))
-                        
-                        # Extract the changes
-                        changes = []
-                        for line in diff:
-                            if line.startswith('+') and not line.startswith('+++'):
-                                changes.append(f"Added: {line[1:]}")
-                            elif line.startswith('-') and not line.startswith('---'):
-                                changes.append(f"Removed: {line[1:]}")
-                        
-                        # Analyze the changes to provide more user-friendly explanation
-                        import re
-                        
-                        added_tables = []
-                        removed_tables = []
-                        
-                        # Look for table name changes in FROM clauses
-                        for change in changes:
-                            # Check for table changes
-                            from_match = re.search(r'FROM\s+([^\s,;]+)', change, re.IGNORECASE)
-                            if from_match:
-                                table_name = from_match.group(1)
-                                if change.startswith("Added"):
-                                    added_tables.append(table_name)
-                                elif change.startswith("Removed"):
-                                    removed_tables.append(table_name)
-                        
-                        # Record what was changed
-                        if added_tables and removed_tables:
-                            debug_context_info["table_changed"] = {
-                                "from": removed_tables[0],
-                                "to": added_tables[0]
-                            }
-                            # Add correction details to debug_actions for user summary
-                            debug_actions_taken.append(f"Correction: Changed table from '{removed_tables[0]}' to '{added_tables[0]}'")
-                        
-                        autonomous_debugging_logs.append(f"Query modifications: {changes}")
-                    
-                    # Save current query for future comparison
-                    debug_context_info["previous_failed_query"] = current_query
-                
                 if progress_callback:
-                    progress_callback(f"Executing {tool_name} with parameters: {parameters}")
+                    progress_callback(f"Executing {tool_name}...")
                 
                 # Execute the tool
                 tool_result = tool_manager.execute_tool(tool_name, parameters)
                 
-                # Store execution in history
-                execution_history.append({
-                    "iteration": tool_iteration,
-                    "tool_name": tool_name,
-                    "parameters": parameters,
-                    "success": tool_result.get("success", False),
-                    "result": tool_result.get("result", ""),
-                    "error": tool_result.get("error", "")
-                })
-                
-                logger.info(f"AUTONOMOUS DEBUG - Tool execution result: success={tool_result.get('success', False)}, error={tool_result.get('error', '')}")
-                
-                # Format the result for user display
+                # Replace the entire response with just the clean tool results
                 if tool_result.get("success"):
                     # Format the result
                     result = tool_result.get("result", "")
@@ -1063,410 +835,25 @@ def get_enhanced_chat_response(message: str, user_id: str, conversation_id: str,
                     else:
                         formatted_result = f"## Results from {tool_name}\n\n{result}"
                     
-                    # Add debugging resolution summary if autonomous debugging was used
-                    if autonomous_debugging_active and debug_actions_taken:
-                        debug_summary = "\n\n## 🔄 Autonomous Issue Resolution\n\n"
-                        
-                        # Add original error
-                        debug_summary += f"**Original Error**: `{last_error}`\n\n"
-                        
-                        # Look for GPT-4o reasoning in the debug context
-                        reasoning_found = False
-                        all_reasoning = []
-                        
-                        # Collect all reasoning entries to show the complete thought process
-                        for entry in execution_history:
-                            if (entry.get("type") == "reasoning" or "reasoning" in entry) and entry.get("reasoning"):
-                                reasoning_text = entry.get("reasoning")
-                                if reasoning_text and reasoning_text.strip():  # Verify non-empty
-                                    all_reasoning.append(reasoning_text)
-                        
-                        # If we have reasoning entries, show them to display the full thought process
-                        if all_reasoning:
-                            # Show the most recent reasoning first for clarity
-                            debug_summary += f"**Latest Reasoning**: {all_reasoning[-1]}\n\n"
-                            
-                            # If there are multiple reasoning steps, show them as a numbered sequence
-                            if len(all_reasoning) > 1:
-                                debug_summary += "**Complete Reasoning Process**:\n\n"
-                                for i, reason in enumerate(all_reasoning):
-                                    if reason and reason.strip():  # Only add non-empty reasoning
-                                        debug_summary += f"{i+1}. {reason}\n\n"
-                            
-                            reasoning_found = True
-                        
-                        # If no reasoning was found, use the old approach based on error type
-                        if not reasoning_found:
-                            # Add concise explanation based on error type
-                            if "Invalid object name" in last_error:
-                                table_match = re.search(r"Invalid object name '([^']+)'", last_error)
-                                invalid_table = table_match.group(1) if table_match else "unknown_table"
-                                
-                                # Focus on correction
-                                if "table_changed" in debug_context_info:
-                                    from_table = debug_context_info["table_changed"]["from"]
-                                    to_table = debug_context_info["table_changed"]["to"]
-                                    debug_summary += f"**Correction**: Table `{from_table}` does not exist. Using `{to_table}` instead.\n\n"
-                                    
-                                    # Ensure we store the correct table name for all cases
-                                    if "table_name" in parameters and parameters["table_name"] == from_table:
-                                        parameters["table_name"] = to_table
-                                else:
-                                    # If we don't have explicit table change info but have the original and new query
-                                    debug_summary += f"**Correction**: Table `{invalid_table}` does not exist. Using correct table name.\n\n"
-                            
-                            elif "column" in last_error.lower() and "not found" in last_error.lower():
-                                debug_summary += "**Correction**: Referenced column does not exist. Using correct column name.\n\n"
-                            
-                            elif "syntax error" in last_error.lower():
-                                debug_summary += "**Correction**: SQL syntax error fixed.\n\n"
-                            
-                            else:
-                                debug_summary += "**Correction**: Issue identified and fixed.\n\n"
-                        
-                        # Show successful execution details
-                        debug_summary += "**Successful Execution**:\n"
-                        debug_summary += f"```\nTool: {tool_name}\n"
-                        
-                        # Handle the case where we need to fix parameter display for successful execution
-                        corrected_parameters = parameters.copy()
-                        
-                        # Special case for the screenshot issue - when tool shows the wrong table name
-                        if tool_name == "sqlendpoint_get_sql_table_schema" and "table_name" in parameters:
-                            # Check if we have an invalid_table from error and it matches our parameter
-                            if "invalid_table" in debug_context_info:
-                                invalid_table = debug_context_info["invalid_table"]
-                                if parameters["table_name"] == invalid_table:
-                                    # We need to find what table name should be used instead
-                                    if "table_changed" in debug_context_info:
-                                        corrected_parameters["table_name"] = debug_context_info["table_changed"]["to"]
-                                    elif "similar_tables" in debug_context_info and debug_context_info["similar_tables"]:
-                                        # Use the first similar table as the corrected name
-                                        corrected_parameters["table_name"] = debug_context_info["similar_tables"][0]
-                            
-                            # Always use the corrected parameters for display
-                            params_display = json.dumps(corrected_parameters, indent=2)
-                        # General case for other parameters
-                        elif "table_changed" in debug_context_info and "table_name" in parameters:
-                            if parameters["table_name"] == debug_context_info["table_changed"]["from"]:
-                                corrected_parameters["table_name"] = debug_context_info["table_changed"]["to"]
-                                params_display = json.dumps(corrected_parameters, indent=2)
-                            else:
-                                params_display = json.dumps(parameters, indent=2)
-                        else:
-                            # Default - format parameters for display
-                            params_display = json.dumps(parameters, indent=2)
-                        
-                        debug_summary += f"Parameters: {params_display}\n```\n"
-                        
-                        # If we have before/after queries, show them for SQL operations
-                        if "previous_failed_query" in debug_context_info and tool_name == "sqlendpoint_execute_sql_query":
-                            debug_summary += "\n**Query Comparison**:\n"
-                            debug_summary += "```diff\n"
-                            debug_summary += f"- Original: {debug_context_info['previous_failed_query']}\n"
-                            debug_summary += f"+ Corrected: {parameters.get('query', '')}\n"
-                            debug_summary += "```\n"
-                        
-                        # Append the debug summary to the formatted result
-                        formatted_result = formatted_result + debug_summary
-                    
-                    # Store the formatted result for the user
-                    formatted_output = formatted_result
-                    
-                    logger.info(f"AUTONOMOUS DEBUG - Tool execution completed successfully")
-                    
+                    # Return only the formatted result, no explanatory text
+                    response = formatted_result
                     if progress_callback:
                         progress_callback("Tool execution completed successfully")
-                        
-                    # If successful, break the loop and return the formatted result
-                    logger.info(f"AUTONOMOUS DEBUG - Tool execution succeeded, breaking loop")
-                    if autonomous_debugging_active:
-                        # Add success message but don't include all the steps
-                        debug_actions_taken.append("Successfully fixed and executed the query")
-                        autonomous_debugging_logs.append("Debugging successful, tool execution completed")
-                    response = formatted_output
-                    break
                 else:
-                    # Set the error flag
-                    has_failures = True
-                    last_error = tool_result.get("error", "Unknown error")
-                    formatted_output = f"❌ Error: {last_error}"
-                    
-                    logger.info(f"AUTONOMOUS DEBUG - Tool execution failed: {last_error}")
-                    
+                    response = f"❌ Error: {tool_result.get('error', 'Unknown error')}"
                     if progress_callback:
-                        progress_callback(f"Tool execution failed: {last_error}")
-                
-                        # If we have a failure, send the error to GPT-4o for autonomous debugging
-                        if has_failures:
-                            logger.info(f"AUTONOMOUS DEBUG - Initiating autonomous debugging for error: {last_error}")
-                            autonomous_debugging_active = True
-                            
-                            # Record only the essential error information, not the debugging steps
-                            debug_actions_taken = []  # Reset previous actions
-                            debug_actions_taken.append(f"Original error: {last_error}")
-                            
-                            if progress_callback:
-                                progress_callback("Initiating autonomous debugging with GPT-4o reasoning...")
-                            
-                            # Create an error analysis entry for the debug context
-                            debug_context_info["error_type"] = "general"
-                            debug_context_info["original_error"] = last_error
-                            debug_context_info["failed_tool"] = tool_name
-                            debug_context_info["failed_parameters"] = parameters
-                            
-                            # Don't pre-analyze or gather diagnostic info - let GPT-4o decide what it needs
-                            # Just log the error and proceed to let GPT-4o handle the debugging entirely
-                            logger.info(f"AUTONOMOUS DEBUG - Passing error to GPT-4o for analysis: {last_error}")
-                            debug_actions_taken.append(f"Detected error: {last_error}")
-                    
-                    # Prepare debug context with execution history and error details
-                    debug_context = {
-                        "execution_history": execution_history,
-                        "current_error": last_error,
-                        "tool_name": tool_name,
-                        "failed_parameters": parameters,
-                        "debugging_iteration": debugging_iteration,
-                        "autonomous_debugging_logs": autonomous_debugging_logs,
-                        "debug_actions_taken": debug_actions_taken,
-                        "diagnostic_info": debug_context_info,  # Include all diagnostic information gathered
-                        "all_reasoning_steps": [entry.get("reasoning") for entry in execution_history if entry.get("reasoning")]  # Collect all reasoning steps
-                    }
-                    
-                    # Count tokens for debug context
-                    debug_context_tokens = count_tokens(json.dumps(debug_context, default=str))
-                    tool_input_tokens += debug_context_tokens
-                    
-                    # Add this debug attempt to the execution history for better context
-                    execution_history.append({
-                        "iteration": tool_iteration,
-                        "type": "debug_attempt",
-                        "error": last_error,
-                        "diagnostic_actions": debug_actions_taken,
-                        "diagnostic_info": debug_context_info
-                    })
-                    
-                    autonomous_debugging_logs.append(f"Debug context created with {len(execution_history)} execution history items")
-                    
-                    # Create an enhanced debug prompt that leverages GPT-4o's general reasoning capabilities
-                    debug_prompt = """
-An error occurred while executing a tool. Please use your advanced reasoning capabilities to:
-1. Analyze the error deeply
-2. Understand the root cause of the issue
-3. Develop a comprehensive solution strategy
-4. Implement the next step in that strategy
-
-ERROR: {error}
-
-FAILED TOOL: {tool}
-
-PARAMETERS: 
-{params}
-
-EXECUTION HISTORY: 
-{history}
-
-DIAGNOSTIC INFORMATION: 
-{diagnostic}
-
-REASONING GUIDANCE:
-- First, identify error patterns (e.g., invalid names, missing values, type mismatches)
-- Consider related schema and structure information that might help (table names, column formats)
-- Analyze parameters for potential issues (typos, case sensitivity, format problems)
-- Consider context from previous exchanges and system state
-- Evaluate multiple possible fix strategies before deciding on the best approach
-- If more information is needed, request it through appropriate diagnostic tools
-
-For SQL errors:
-- Check table names, column names, syntax, and query structure
-- Look for similar table or column names if "not found" errors occur
-- Verify data types match in comparisons and joins
-
-For Power BI errors:
-- Verify connection parameters and authentication
-- Check DAX syntax and function usage
-- Verify table and column references exist in the model
-
-For general errors:
-- Check parameter formats and values
-- Look for missing required parameters
-- Verify prerequisites are met before execution
-
-Your response MUST follow this format EXACTLY:
-
-REASONING: A thorough explanation of your diagnosis and fix strategy (3-5 sentences)
-
-TOOL_EXECUTION:
-{{
-    "tool": "[tool_name]",
-    "parameters": {{
-        "param1": "value1",
-        "param2": "value2"
-    }}
-}}
-
-IMPORTANT: If you've found any tables in the database that could match the user's intent, you MUST construct a query using that table and execute it immediately. DO NOT stop at just finding the tables - you MUST complete the user's request by running the corrected query with the proper table name.
-""".format(
-    error=last_error,
-    tool=tool_name,
-    params=json.dumps(parameters, indent=2),
-    history=json.dumps(execution_history, indent=2),
-    diagnostic=json.dumps(debug_context_info, indent=2)
-)
-                    
-                    # Prepare messages for debug request
-                    debug_messages = [
-                        {"role": "system", "content": system_message},
-                        {"role": "user", "content": message},  # Original user message
-                        {"role": "assistant", "content": response},  # Original response with TOOL_EXECUTION
-                        {"role": "system", "content": f"Tool execution failed with error: {last_error}"},
-                        {"role": "user", "content": debug_prompt}
-                    ]
-                    
-                    # Add the debug step to conversation history for context
-                    if progress_callback:
-                        progress_callback("Generating autonomous fix...")
-                    
-                    # Get the autonomous fix response from GPT-4o
-                    debug_response = client.chat.completions.create(
-                        model=azure_deployment,
-                        messages=debug_messages,
-                        temperature=0.2,
-                        max_tokens=1000
-                    )
-                    
-                    # Extract the message content
-                    debug_response_content = debug_response.choices[0].message.content
-                    
-                    # Track tokens used in debugging
-                    if hasattr(debug_response, 'usage'):
-                        tool_input_tokens += debug_response.usage.prompt_tokens
-                        tool_output_tokens += debug_response.usage.completion_tokens
-                    else:
-                        # Rough estimation if usage stats not available
-                        tool_input_tokens += count_tokens(json.dumps(debug_messages, default=str))
-                        tool_output_tokens += count_tokens(debug_response_content)
-                    
-                    logger.info(f"AUTONOMOUS DEBUG - Debug response: {debug_response_content}")
-                    
-                    # Extract the reasoning and tool execution parts from the response
-                    reasoning = ""
-                    tool_execution = ""
-                    
-                    if "REASONING:" in debug_response_content and "TOOL_EXECUTION:" in debug_response_content:
-                        try:
-                            # Split response to get reasoning and tool execution
-                            parts = debug_response_content.split("TOOL_EXECUTION:", 1)
-                            reasoning_part = parts[0].strip()
-                            tool_execution = "TOOL_EXECUTION:" + parts[1].strip()
-                            
-                            # Extract just the reasoning text
-                            if "REASONING:" in reasoning_part:
-                                reasoning = reasoning_part.split("REASONING:", 1)[1].strip()
-                                if progress_callback:
-                                    progress_callback(f"GPT-4o reasoning: {reasoning}")
-                                
-                                # Add reasoning to debug logs for transparency
-                                autonomous_debugging_logs.append(f"Reasoning: {reasoning}")
-                                debug_actions_taken.append(f"Analysis: {reasoning}")
-                            
-                            # Log the reasoning for debugging
-                            logger.info(f"GPT-4o reasoning: {reasoning}")
-                            
-                            # Store reasoning in execution history
-                            execution_history.append({
-                                "iteration": tool_iteration,
-                                "type": "reasoning",
-                                "reasoning": reasoning
-                            })
-                            
-                            # Update the response to continue the autonomous debugging loop
-                            response_content = tool_execution
-                        except Exception as e:
-                            logger.error(f"Error processing debug response: {str(e)}")
-                            response_content = debug_response_content
-                    else:
-                        # Fallback if format doesn't match expectations
-                        response_content = debug_response_content
-                    
-                    # Continue to next iteration (will process the new TOOL_EXECUTION if present)
-                    autonomous_debugging_logs.append(f"Debug response received, continuing to next iteration")
+                        progress_callback("Tool execution failed")
                     
             except json.JSONDecodeError:
-                # If we can't parse the tool execution, break the loop
                 response += "\n\n⚠️ Could not parse tool execution request. Please check the format."
                 if progress_callback:
                     progress_callback("Tool parsing failed")
-                break
-                
             except Exception as e:
-                # If we encounter an error, break the loop
                 response += f"\n\n❌ Tool execution error: {str(e)}"
                 if progress_callback:
                     progress_callback(f"Tool execution error: {str(e)}")
-                break
         
-        # If we've reached the maximum iterations, provide a summary of what happened
-        if tool_iteration >= max_tool_iterations and has_failures:
-            logger.info(f"AUTONOMOUS DEBUG - Reached maximum iterations ({max_tool_iterations}) without resolving the issue")
-            autonomous_debugging_logs.append(f"Failed to resolve after {debugging_iteration} debugging attempts")
-            
-            # Prepare a final message about the debugging attempts
-            debug_summary_prompt = "After " + str(max_tool_iterations) + " autonomous debugging attempts, the issue could not be fully resolved.\n\n"
-            debug_summary_prompt += "ORIGINAL ERROR: " + last_error + "\n\n"
-            debug_summary_prompt += "EXECUTION HISTORY: " + json.dumps(execution_history, indent=2) + "\n\n"
-            debug_summary_prompt += "DEBUGGING ACTIONS: " + json.dumps(debug_actions_taken, indent=2) + "\n\n"
-            debug_summary_prompt += "Please provide a concise summary of the attempts made and recommend the best next steps for the user.\n"
-            debug_summary_prompt += "Your response should be helpful and actionable. Include suggestions for what the user might try differently."
-            
-            # Count tokens for the summary prompt
-            summary_prompt_tokens = count_tokens(debug_summary_prompt)
-            tool_input_tokens += summary_prompt_tokens
-            
-            # Create messages for the summary request
-            summary_messages = [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": message},  # Original user message
-                {"role": "system", "content": debug_summary_prompt}
-            ]
-            
-            # Get the summary response
-            summary_response = client.chat.completions.create(
-                model=azure_deployment,
-                messages=summary_messages,
-                temperature=0.7,
-                max_tokens=1000
-            )
-            
-            # Extract the message content
-            summary_content = summary_response.choices[0].message.content
-            
-            # Track tokens used in the summary
-            if hasattr(summary_response, 'usage'):
-                tool_input_tokens += summary_response.usage.prompt_tokens
-                tool_output_tokens += summary_response.usage.completion_tokens
-            else:
-                # Rough estimation if usage stats not available
-                tool_output_tokens += count_tokens(summary_content)
-            
-            response_content = summary_content
-        
-        # Add all token counts together
-        total_input_tokens = input_tokens + tool_input_tokens
-        total_output_tokens = output_tokens + tool_output_tokens
-        
-        # Update the token usage for this session
-        if conversation_id not in token_usage:
-            token_usage[conversation_id] = {"input": 0, "output": 0}
-        token_usage[conversation_id]["input"] += total_input_tokens
-        token_usage[conversation_id]["output"] += total_output_tokens
-        
-        # Append token usage information to the response
-        token_info = f"\n\n---\n**Token Usage:** {total_input_tokens} input + {total_output_tokens} output = {total_input_tokens + total_output_tokens} total tokens"
-        response_content += token_info
-        
-        # Return the final response (either successful result or debug information)
-        return response_content
+        return response
         
     except Exception as e:
         logger.error(f"Error in enhanced chat response: {e}")
@@ -1493,9 +880,6 @@ def index():
 
 # Global dictionary to store conversation history by session_id
 conversation_sessions = {}
-
-# Global dictionary to store token usage by session_id
-token_usage = {}
 
 @app.route('/api/chat', methods=['POST', 'GET'])
 def chat():
@@ -1560,19 +944,11 @@ def chat():
                     # Format the result to be more readable
                     formatted_result = ""
                     try:
-                        # Safely handle DataFrame and other complex objects
-                        if isinstance(tool_result, pd.DataFrame):
-                            # Convert DataFrame to list of dictionaries for JSON serialization
-                            serialized_result = tool_result.to_dict(orient='records')
-                            formatted_result = json.dumps(serialized_result, indent=2, default=safe_serialize)
-                            # Update the tool_result to be JSON serializable
-                            tool_result = serialized_result
-                        elif isinstance(tool_result, (dict, list)):
-                            formatted_result = json.dumps(tool_result, indent=2, default=safe_serialize)
+                        if isinstance(tool_result, (dict, list)):
+                            formatted_result = json.dumps(tool_result, indent=2, default=str)
                         else:
                             formatted_result = str(tool_result)
-                    except Exception as format_err:
-                        logger.warning(f"Error formatting result: {format_err}")
+                    except:
                         formatted_result = str(tool_result)
                     
                     # Add formatted result to the list of results
@@ -1623,19 +999,11 @@ def chat():
                     # Format the result to be more readable
                     formatted_result = ""
                     try:
-                        # Safely handle DataFrame and other complex objects
-                        if isinstance(tool_result, pd.DataFrame):
-                            # Convert DataFrame to list of dictionaries for JSON serialization
-                            serialized_result = tool_result.to_dict(orient='records')
-                            formatted_result = json.dumps(serialized_result, indent=2, default=safe_serialize)
-                            # Update the tool_result to be JSON serializable
-                            tool_result = serialized_result
-                        elif isinstance(tool_result, (dict, list)):
-                            formatted_result = json.dumps(tool_result, indent=2, default=safe_serialize)
+                        if isinstance(tool_result, (dict, list)):
+                            formatted_result = json.dumps(tool_result, indent=2, default=str)
                         else:
                             formatted_result = str(tool_result)
-                    except Exception as format_err:
-                        logger.warning(f"Error formatting result: {format_err}")
+                    except:
                         formatted_result = str(tool_result)
                     
                     # Add formatted result to the list of results
@@ -1658,31 +1026,12 @@ def chat():
                         "content": f"Tool result:\n\n{formatted_result}"
                     })
                 else:
-                    # Instead of returning the error directly, we'll initiate autonomous debugging
-                    logger.info(f"Tool execution failed: {result['error']} - Initiating autonomous debugging")
-                    
-                    # Add the error to conversation history
-                    conversation_history.append({
-                        "role": "system",
-                        "content": f"Tool execution failed: {result['error']}"
-                    })
-                    
-                    # Record the error for diagnostic display to the user
-                    error_message = result['error']
-                    
-                    # Continue with the normal flow - the error will be handled by autonomous debugging
+                    logger.error(f"Tool execution failed: {result['error']}")
+                    return jsonify({'error': result['error']}), 400
             
             except Exception as e:
-                logger.info(f"Error executing tool {tool_name}: {str(e)} - Initiating autonomous debugging")
-                
-                # Add the error to conversation history
-                conversation_history.append({
-                    "role": "system",
-                    "content": f"Tool execution error: {str(e)}"
-                })
-                
-                # Record the error for diagnostic display to the user
-                error_message = str(e)
+                logger.error(f"Error executing tool {tool_name}: {str(e)}")
+                return jsonify({'error': f"Tool execution error: {str(e)}"}), 500
         
         # Add the current user message to history
         conversation_history.append({
@@ -1690,52 +1039,16 @@ def chat():
             "content": user_message
         })
         
-        # Flag to track autonomous debugging
-        autonomous_debugging_occurred = False
-        debug_logs = []
-        
-        # Call get_enhanced_chat_response to generate the response with autonomous debugging
+        # Call get_enhanced_chat_response to generate the response
         try:
-            # Check if we have an error that needs autonomous debugging
-            extra_context = None
-            if 'error_message' in locals():
-                logger.info(f"Passing error to autonomous debugging: {error_message}")
-                extra_context = f"""
-                A tool execution error occurred that requires autonomous debugging:
-                Error: {error_message}
-                
-                Please diagnose this issue and solve it without requiring user intervention.
-                Use appropriate diagnostic tools to identify the problem, then fix it automatically.
-                """
-                autonomous_debugging_occurred = True
-                debug_logs.append(f"Initiating autonomous debugging for error: {error_message}")
-            
-            # Use the enhanced chat response function with MCP tool integration and autonomous debugging
+            # Use the enhanced chat response function with MCP tool integration
             assistant_message = get_enhanced_chat_response(
                 message=user_message,
                 user_id="web_user",
                 conversation_id=session_id,
                 conversation_history=conversation_history,
-                progress_callback=track_progress,
-                extra_debug_context=extra_context
+                progress_callback=track_progress
             )
-            
-            # Check if autonomous debugging occurred by looking at progress updates
-            autonomous_debugging_occurred = any("autonomous" in update.lower() or 
-                                               "debugging" in update.lower() or
-                                               "fixing" in update.lower() or
-                                               "retry" in update.lower() 
-                                               for update in progress_updates)
-            
-            if autonomous_debugging_occurred:
-                debug_logs = [update for update in progress_updates 
-                             if "autonomous" in update.lower() or 
-                                "debugging" in update.lower() or
-                                "fixing" in update.lower() or
-                                "retry" in update.lower() or
-                                "error" in update.lower()]
-                
-                logger.info(f"Autonomous debugging performed: {len(debug_logs)} steps")
             
             # Add the assistant's response to the conversation history
             conversation_history.append({
@@ -1746,48 +1059,18 @@ def chat():
             # Save the updated conversation history
             conversation_sessions[session_id] = conversation_history
             
-            # Include token usage in the response
-            session_token_usage = token_usage.get(session_id, {"input": 0, "output": 0})
-            
         except Exception as e:
             logger.error(f"Azure OpenAI API error: {str(e)}")
             assistant_message = f"I couldn't generate a response using Azure OpenAI API. Error: {str(e)}"
-            # Initialize token usage if this is a new session
-            if session_id not in token_usage:
-                token_usage[session_id] = {"input": 0, "output": 0}
-            session_token_usage = token_usage[session_id]
         
-        # Add error information if available
-        error_info = None
-        if 'error_message' in locals():
-            error_info = {
-                'error': error_message,
-                'tool_name': tool_name if 'tool_name' in locals() else None,
-                'parameters': tool_params if 'tool_params' in locals() else None
-            }
-        
-        # Create response data with custom JSON serialization for complex objects
-        response_data = {
+        # Return the assistant's response along with any tool results
+        return jsonify({
             'message': assistant_message,
             'tool_results': tool_results,
             'auto_executed_tools': executed_tool_names,
             'progress': progress_updates,
-            'debug_logs': debug_logs,
-            'autonomous_debugging_performed': autonomous_debugging_occurred,
-            'error_info': error_info,
-            'session_id': session_id,
-            'token_usage': {
-                'input_tokens': session_token_usage['input'],
-                'output_tokens': session_token_usage['output'],
-                'total_tokens': session_token_usage['input'] + session_token_usage['output']
-            }
-        }
-        
-        # Use Flask's Response with custom JSON serialization
-        return Response(
-            json.dumps(response_data, default=safe_serialize),
-            mimetype='application/json'
-        )
+            'session_id': session_id
+        })
     
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
@@ -1851,84 +1134,6 @@ def get_session_history(session_id):
         "session_id": session_id,
         "history": history,
         "message_count": len(history)
-    })
-
-@app.route('/api/sessions/<session_id>/download', methods=['GET'])
-def download_session_history(session_id):
-    """Download conversation history as a text file"""
-    from flask import Response
-    import datetime
-    
-    if session_id not in conversation_sessions:
-        return jsonify({"error": "Session not found"}), 404
-    
-    history = conversation_sessions[session_id]
-    
-    # Format the conversation into a readable text format
-    conversation_text = f"Power BI Assistant Chat - Session: {session_id}\n"
-    conversation_text += f"Downloaded on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    
-    for msg in history:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        
-        if role == "user":
-            conversation_text += "You:\n"
-        elif role == "assistant":
-            conversation_text += "Assistant:\n"
-        elif role == "system" and "Tool result" in content:
-            conversation_text += "Tool Output:\n"
-            content = content.replace("Tool result:", "")
-        else:
-            conversation_text += f"{role.capitalize()}:\n"
-        
-        # Clean up markdown code blocks for better readability in text
-        content = content.replace("```json\n", "").replace("```\n", "").replace("```", "")
-        conversation_text += f"{content}\n\n"
-    
-    # Create a response with the text content
-    response = Response(conversation_text, mimetype='text/plain')
-    response.headers["Content-Disposition"] = f"attachment; filename=PowerBI_Assistant_Chat_{session_id}_{datetime.datetime.now().strftime('%Y%m%d')}.txt"
-    
-    return response
-
-@app.route('/api/token-usage', methods=['GET'])
-def get_token_usage():
-    """API endpoint to get token usage across all sessions"""
-    # Calculate total token usage
-    total_input = sum(session["input"] for session in token_usage.values())
-    total_output = sum(session["output"] for session in token_usage.values())
-    
-    # Format detailed session usage
-    session_details = {}
-    for session_id, usage in token_usage.items():
-        session_details[session_id] = {
-            "input_tokens": usage["input"],
-            "output_tokens": usage["output"],
-            "total_tokens": usage["input"] + usage["output"]
-        }
-    
-    return jsonify({
-        "total_usage": {
-            "input_tokens": total_input,
-            "output_tokens": total_output,
-            "total_tokens": total_input + total_output
-        },
-        "session_usage": session_details
-    })
-
-@app.route('/api/sessions/<session_id>/token-usage', methods=['GET'])
-def get_session_token_usage(session_id):
-    """API endpoint to get token usage for a specific session"""
-    if session_id not in token_usage:
-        return jsonify({"error": "Session not found"}), 404
-    
-    usage = token_usage[session_id]
-    return jsonify({
-        "session_id": session_id,
-        "input_tokens": usage["input"],
-        "output_tokens": usage["output"],
-        "total_tokens": usage["input"] + usage["output"]
     })
 
 if __name__ == '__main__':

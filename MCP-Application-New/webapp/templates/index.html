@@ -39,13 +39,6 @@
             align-items: center;
             font-size: 0.9em;
         }
-        #download-chat {
-            background-color: #1b5e20;
-            transition: background-color 0.3s;
-        }
-        #download-chat:hover {
-            background-color: #2e7d32;
-        }
         .chat-container {
             display: flex;
             flex-grow: 1;
@@ -89,17 +82,6 @@
         .assistant-message {
             background-color: #f0f0f0;
             align-self: flex-start;
-            font-size: 16px;
-        }
-        .assistant-message h1, 
-        .assistant-message h2, 
-        .assistant-message h3, 
-        .assistant-message h4, 
-        .assistant-message h5, 
-        .assistant-message h6 {
-            font-size: 16px;
-            font-weight: bold;
-            margin: 8px 0;
         }
         .tool-message {
             background-color: #fffacd;
@@ -107,17 +89,6 @@
             font-family: monospace;
             white-space: pre-wrap;
             overflow-x: auto;
-            font-size: 16px;
-        }
-        .tool-message h1, 
-        .tool-message h2, 
-        .tool-message h3, 
-        .tool-message h4, 
-        .tool-message h5, 
-        .tool-message h6 {
-            font-size: 16px;
-            font-weight: bold;
-            margin: 8px 0;
         }
         .input-area {
             padding: 15px;
@@ -188,16 +159,7 @@
         }
         code {
             font-family: 'Courier New', Courier, monospace;
-            font-size: 16px;
-        }
-        .message p, 
-        .message span, 
-        .message div, 
-        .message li,
-        .message a {
-            font-size: 16px !important;
-            line-height: 1.5;
-            margin: 0 0 8px 0;
+            font-size: 14px;
         }
         .is-invalid {
             border-color: #dc3545 !important;
@@ -212,31 +174,11 @@
         .param-hint:hover {
             text-decoration: underline;
         }
-        #token-usage {
-            background-color: rgba(255, 255, 255, 0.2);
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-size: 0.85em;
-            margin-left: 5px;
-        }
-        .token-info {
-            font-size: 0.8em;
-            color: #666;
-            text-align: right;
-            margin-top: 5px;
-            font-style: italic;
-        }
     </style>
 </head>
 <body>
     <div class="header">
         <h1>Power BI Assistant</h1>
-        <div class="session-controls">
-            <button id="new-session" class="btn btn-sm btn-outline-light mx-2">New Conversation</button>
-            <button id="download-chat" class="btn btn-sm btn-outline-light mx-2">Download Chat</button>
-            <span class="text-light small">Session ID: <span id="current-session-id"></span></span>
-            <span class="text-light small ms-3">Token Usage: <span id="token-usage">0 input / 0 output</span></span>
-        </div>
     </div>
     
     <div class="container">
@@ -314,47 +256,13 @@
             const selectedToolName = document.getElementById('selected-tool-name');
             const executeToolButton = document.getElementById('execute-tool');
             const cancelToolButton = document.getElementById('cancel-tool');
-            const tokenUsageDisplay = document.getElementById('token-usage');
-            const currentSessionIdDisplay = document.getElementById('current-session-id');
             
             let toolsInfo = {};
             let currentToolName = null;
-            let inputTokens = 0;
-            let outputTokens = 0;
             
             // Session management
             let sessionId = localStorage.getItem('sessionId') || generateSessionId();
             let conversationHistory = JSON.parse(localStorage.getItem('conversationHistory') || '[]');
-            
-            // Update the session ID display
-            currentSessionIdDisplay.textContent = sessionId;
-            
-            // Update token usage display
-            function updateTokenUsageDisplay() {
-                tokenUsageDisplay.textContent = `${inputTokens} input / ${outputTokens} output`;
-            }
-            
-            // Fetch token usage for current session
-            function fetchTokenUsage() {
-                fetch(`/api/sessions/${sessionId}/token-usage`)
-                    .then(response => {
-                        if (!response.ok) {
-                            throw new Error('Failed to fetch token usage');
-                        }
-                        return response.json();
-                    })
-                    .then(data => {
-                        inputTokens = data.input_tokens;
-                        outputTokens = data.output_tokens;
-                        updateTokenUsageDisplay();
-                    })
-                    .catch(error => {
-                        console.error('Error fetching token usage:', error);
-                    });
-            }
-            
-            // Initialize token usage
-            fetchTokenUsage();
             
             // Display existing conversation if any
             if (conversationHistory.length > 0) {
@@ -670,16 +578,6 @@
                             sessionId = data.session_id;
                             localStorage.setItem('sessionId', sessionId);
                         }
-                        
-                        // Update token usage if available
-                        if (data.token_usage) {
-                            inputTokens += data.token_usage.input_tokens || 0;
-                            outputTokens += data.token_usage.output_tokens || 0;
-                            updateTokenUsageDisplay();
-                        } else {
-                            // Fetch latest token usage if not provided in response
-                            fetchTokenUsage();
-                        }
                     }
                     
                     // Hide tool params
@@ -749,16 +647,6 @@
                             sessionId = data.session_id;
                             localStorage.setItem('sessionId', sessionId);
                         }
-                        
-                        // Update token usage if available
-                        if (data.token_usage) {
-                            inputTokens += data.token_usage.input_tokens || 0;
-                            outputTokens += data.token_usage.output_tokens || 0;
-                            updateTokenUsageDisplay();
-                        } else {
-                            // Fetch latest token usage if not provided in response
-                            fetchTokenUsage();
-                        }
                     }
                 })
                 .catch(error => {
@@ -774,14 +662,6 @@
                 // Process markdown for assistant and tool messages
                 if (sender === 'assistant' || sender === 'tool') {
                     messageDiv.innerHTML = marked.parse(content);
-                    
-                    // Ensure consistent text size for all elements in the message
-                    const headings = messageDiv.querySelectorAll('h1, h2, h3, h4, h5, h6');
-                    headings.forEach(heading => {
-                        heading.style.fontSize = '16px';
-                        heading.style.fontWeight = 'bold';
-                        heading.style.margin = '8px 0';
-                    });
                 } else {
                     messageDiv.textContent = content;
                 }
@@ -795,9 +675,15 @@
                 messagesContainer.scrollTop = messagesContainer.scrollHeight;
             }
             
-            // Session controls are already defined in HTML
-            // Update the session ID in the existing UI
-            document.getElementById('current-session-id').textContent = sessionId;
+            // Add UI for session management
+            const header = document.querySelector('.header');
+            const sessionControls = document.createElement('div');
+            sessionControls.className = 'session-controls';
+            sessionControls.innerHTML = `
+                <button id="new-session" class="btn btn-sm btn-outline-light mx-2">New Conversation</button>
+                <span class="text-light small">Session ID: <span id="current-session-id">${sessionId}</span></span>
+            `;
+            header.appendChild(sessionControls);
             
             // Add event listener for new session button
             document.getElementById('new-session').addEventListener('click', function() {
@@ -810,11 +696,6 @@
                     conversationHistory = [];
                     localStorage.setItem('conversationHistory', JSON.stringify(conversationHistory));
                     
-                    // Reset token usage
-                    inputTokens = 0;
-                    outputTokens = 0;
-                    updateTokenUsageDisplay();
-                    
                     // Clear chat display
                     messagesContainer.innerHTML = '';
                     
@@ -822,90 +703,6 @@
                     addMessage('Hello! I\'m your Power BI Assistant. How can I help you with your dataset today?', 'assistant');
                 }
             });
-
-            // Add event listener for download chat button
-            document.getElementById('download-chat').addEventListener('click', function() {
-                downloadConversation();
-            });
-
-            // Function to download conversation history as a text file
-            function downloadConversation() {
-                // Check if we have a valid session
-                if (!sessionId) {
-                    alert('No active session to download.');
-                    return;
-                }
-                
-                // Determine download method based on history source
-                if (conversationHistory.length > 0) {
-                    // Client-side download if we have history in browser
-                    downloadFromLocalHistory();
-                } else {
-                    // Server-side download - better for persisted history
-                    downloadFromServer();
-                }
-            }
-            
-            // Download conversation from local browser history
-            function downloadFromLocalHistory() {
-                if (conversationHistory.length === 0) {
-                    alert('No conversation to download.');
-                    return;
-                }
-                
-                // Format the conversation into a readable text format
-                let conversationText = `Power BI Assistant Chat - Session: ${sessionId}\n`;
-                conversationText += `Downloaded on: ${new Date().toLocaleString()}\n\n`;
-                
-                conversationHistory.forEach((msg, index) => {
-                    const sender = msg.type === 'user' ? 'You' : 
-                                  msg.type === 'assistant' ? 'Assistant' : 'Tool';
-                    
-                    conversationText += `${sender}:\n`;
-                    
-                    // Clean up markdown code blocks for better readability in text
-                    let content = msg.content;
-                    content = content.replace(/```(json|python|sql|dax)?\n/g, ''); // Remove code block start
-                    content = content.replace(/```/g, ''); // Remove code block end
-                    
-                    conversationText += `${content}\n\n`;
-                });
-                
-                // Create a Blob with the text content
-                const blob = new Blob([conversationText], { type: 'text/plain' });
-                
-                // Create a temporary link to download the file
-                const a = document.createElement('a');
-                const url = URL.createObjectURL(blob);
-                a.href = url;
-                a.download = `PowerBI_Assistant_Chat_${new Date().toISOString().split('T')[0]}.txt`;
-                document.body.appendChild(a);
-                a.click();
-                
-                // Cleanup
-                setTimeout(() => {
-                    document.body.removeChild(a);
-                    window.URL.revokeObjectURL(url);
-                }, 0);
-            }
-            
-            // Download conversation from server
-            function downloadFromServer() {
-                // Use the server's download endpoint which handles formatting
-                const downloadUrl = `/api/sessions/${sessionId}/download`;
-                
-                // Create a hidden link and trigger download
-                const a = document.createElement('a');
-                a.href = downloadUrl;
-                a.download = `PowerBI_Assistant_Chat_${sessionId}.txt`;
-                document.body.appendChild(a);
-                a.click();
-                
-                // Cleanup
-                setTimeout(() => {
-                    document.body.removeChild(a);
-                }, 0);
-            }
         });
     </script>
 </body>

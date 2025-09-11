@@ -1,0 +1,12 @@
+{
+    "inputs": [],
+    "servers": {
+        "MCP": {
+            "command": ".venv\\Scripts\\python.exe",
+            "args":[
+                "src\\server.py"
+            ],
+            "env": ".env"
+        }
+    }
+}
